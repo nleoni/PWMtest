@@ -1,0 +1,413 @@
+//Thermistor Controlled HOT PLate program
+//This Program is an initial test for the AVEO platform
+//Implements an interpolation function for the thermistor, samples the
+
+#include <TimerOne.h>
+#include <SPI.h>
+#include <math.h>
+
+#define DEBUGNL
+#define MAXCOMMANDLENGTH 24
+#define MAXSAMPLES 200 //this means about 200 bytes not much out of the 2kb available
+#define TIMERINTPERIOD 20//default timer interrupt period in usseconds
+#define DEFAULTFREQ 100//default waveform frequency in Hz
+#define TIMERPERIOD 8333//default period us
+
+//PWM CONSTANTS
+#define MAXTIMERPERIOD 100000
+#define MINTIMERPERIOD 100
+#define MAXNCYCLES 2048
+#define MINNCYCLES 10
+
+//THERMISTOR CONSTANTS
+#define ADCresolution 1023 //adc resolution
+#define ADCVmax 5 //adc max voltgae reading
+//Thermistor Constants
+#define R0Thermistor 100000
+#define T0Thermistor 298.15 //25 C, 298.15 K
+#define BetaThermistor 4144 //beta value for Thermistor
+#define VBIAS 5.0
+#define RBIAS 100000.0
+
+#include "Adafruit_BLE_UART.h"
+
+// Connect CLK/MISO/MOSI to hardware SPI
+// e.g. On UNO & compatible: CLK = 13, MISO = 12, MOSI = 11
+#define ADAFRUITBLE_REQ 10
+#define ADAFRUITBLE_RDY 2     // This should be an interrupt pin, on Uno thats #2 or #3
+#define ADAFRUITBLE_RST 9
+
+Adafruit_BLE_UART BTLEserial = Adafruit_BLE_UART(ADAFRUITBLE_REQ, ADAFRUITBLE_RDY, ADAFRUITBLE_RST);
+aci_evt_opcode_t laststatus = ACI_EVT_DISCONNECTED;
+aci_evt_opcode_t status;
+
+//************************************************************//
+//--------------------variable Definitions----------//
+const int thermistorInput = A0;  // Analog input pin that the potentiometer is attached to
+const int thermistorMonitor = 3; // Analog output pin that the LED is attached to
+const int heaterRelay = 7;      //Digital
+
+long timerperiod=TIMERPERIOD;
+float Tc;
+
+//State Machine STATUS DEFINITIONS
+#define IDLESTATE       0x0000
+#define TEMPREPORTON   0x0010      //temperature is reported at every pwmTimeBase interval
+#define PWMON          0x0100      //PWM heater output is on at specified power level
+int machineState = IDLESTATE;
+int test = 0;
+//TemperatureData Available
+char temperatureDataAvailable=0;
+
+//PWM with relay definitions
+int pwmNCycles=256;     //granularity ofPWM control with relay
+int pwmPeriod=8333;     //period in us for timer interrupt
+int pwmTimeBase;        //time interval at which the power level may be updated nCycles*period
+int pwmCurrentCycle=1;  
+float pwmPowerLevel=0;  //power level as fraction to be used to determine how many cycle of nCycles relay will be on
+float pwmMaxPower=0.2;  //max power level specified by user, saturation level used when a PID tries to increase power
+
+//************************************************************//
+//--------------------Function Prototype Definitions----------//
+
+void setup() {
+    // initialize serial communications at 38400 bps:
+    Serial.begin(38400);
+    // initialize serial communication:
+    //Serial.begin(38400);
+    // initialize the LED pins:
+    Serial.print(">");
+    Serial.print(">");
+    Serial.print("Thermistor Temperature Control\n");
+    Serial.println(F("Adafruit Bluefruit Low Energy nRF8001 Print echo demo"));
+    Serial.print("written by Napoleon Leoni, Summer 2014.\n");
+    Serial.print(">");
+
+    BTLEserial.begin();
+    //specify heater relay pin as an output
+    pinMode(heaterRelay,OUTPUT);
+    pinMode(4,OUTPUT);
+    //Timer interrupt initialize
+    Timer1.initialize(pwmPeriod);
+    
+}
+
+void loop() {
+    // check the serial input
+    //note that the processcommand function is blocking!!
+    // Tell the nRF8001 to do whatever it should be working on.
+    BTLEserial.pollACI();
+    checkBLEstatus();
+    processCommand();//this function parses a command
+    if(temperatureDataAvailable && (machineState&TEMPREPORTON) ) {
+      printStatusBLE();
+      printStatusSerial();
+      //reset flag
+      temperatureDataAvailable=0;
+    }
+    
+}
+
+void processCommand(){
+    char str[MAXCOMMANDLENGTH]="",temp[MAXCOMMANDLENGTH];
+    char* strCommands[]={"placeholder","placeholder","placeholder","placeholder","placeholder"};
+    char **myCommand = strCommands;
+    char delim[]="-";
+    char *pch,*pStr;
+    pStr=str;
+    int i=0,j=0;
+    if (Serial.available() > 0){
+        do{
+            if(Serial.available() >0 ){
+                str[i]=Serial.read();
+                Serial.print(str[i]);
+                i=i+1;
+            }
+        } while(str[i-1]!='\n');
+        Serial.print(">");
+
+    } else if (status == ACI_EVT_CONNECTED) {
+    // Lets see if there's any data for us!
+    if (BTLEserial.available()) {
+      Serial.print("* "); Serial.print(BTLEserial.available()); Serial.println(F(" bytes available from BTLE"));
+    }
+    // OK while we still have something to read, get a character and print it out
+      while (BTLEserial.available()) {
+        str[i]=BTLEserial.read();
+        i=i+1;
+      }
+      //Serial.print("Received Command");
+      //Serial.print(str[i]);
+    } else {
+        return;
+    }
+    
+    
+    //Replace \n newline character with strinf delimiter \0
+    str[i-1]='\0';
+
+    //Remove all spaces from command string
+    spaceEater(pStr);
+    //Here we split the string using the defined delimiter
+    pch = strtok (str,delim);
+    strCommands[j]=pch;
+    while (pch != NULL && j<4)
+    {
+        pch = strtok (NULL, delim);
+        j++;
+        strCommands[j]=pch;
+    }
+    parseCommand(strCommands,j);
+    
+}
+
+void spaceEater(char *fatString){
+	char slimString[MAXCOMMANDLENGTH];
+	char *slimp;
+	int i=0;
+	slimp=slimString;
+	while(*(fatString+i*sizeof(char))!='\0'){
+		if(*(fatString+i*sizeof(char))!=' '){
+			*slimp=*(fatString+i*sizeof(char));
+			slimp++;
+		}
+		i++;
+	}
+	*slimp='\0';
+#ifdef DEBUGNL
+//        Serial.print("Slim String is:");
+//	Serial.print(slimString);
+//        Serial.print("\n>");
+#endif
+	slimp=slimString;
+	while(*slimp!='\0'){
+        *fatString=*slimp;
+        slimp++;
+        fatString++;
+	}
+	*fatString='\0';
+	return;
+}
+
+void parseCommand(char **myCommand,int nArguments){
+    //This is here the action is here generate different types of waves
+    //walk across the command parts using the argument number
+    int i=1;
+    int frequency=DEFAULTFREQ;
+    long interruptPeriod;
+    unsigned char address=0,data=0; //default addresss to read from
+
+    //******************start command processing*********************//    
+   if(strcmp(myCommand[0],"start")==0){//process the start here
+    Serial.print("Start Command Called\n>");
+    start(timerperiod);
+
+    //******************stop command processing*********************//    
+    } else if(strcmp(myCommand[0],"stop")==0){//process the stop command here
+        stop();
+
+    //******************temperature report command processing*********************//    
+    } else if(strcmp(myCommand[0],"temp")==0){//process the start here
+    Serial.print("temperature Command Called\n>");
+         while(i<nArguments){
+             Serial.print("command:");
+             Serial.print(myCommand[i]);
+             Serial.print("\n>");
+            if(!strcmp(myCommand[i],"on")){
+               machineState=machineState|TEMPREPORTON;
+            }
+            if(!strcmp(myCommand[i],"off")){
+               machineState=machineState&(~TEMPREPORTON);
+            }
+            i++;
+        }
+    //start(timerperiod);
+
+    //******************pwm command processing*********************//    
+    } else if(strcmp(myCommand[0],"pwm")==0){//process the stop command here
+        while(i<nArguments){
+            char *pComm=myCommand[i];
+             Serial.print("command:");
+             Serial.print(myCommand[i]);
+             Serial.print("\n>");
+             
+             if(!strcmp(myCommand[i],"on")){
+               machineState=machineState|PWMON;               
+               Serial.print("PWM is on\n>");
+            }
+            if(!strcmp(myCommand[i],"off")){
+               machineState=machineState&(~PWMON);
+               Serial.print("PWM is off\n>");
+            }
+           if(*pComm=='p'){ 
+             float temppwm=(float)atoi(pComm+1)/100.;
+             if((temppwm<=1)&&(temppwm>=0)) pwmPowerLevel=temppwm;   
+              if(pwmPowerLevel>pwmMaxPower){
+                pwmPowerLevel=pwmMaxPower;
+                Serial.print("Exceeded Max Duty Cycle, power set to Pmax");
+                
+              }
+              Serial.print("PWM power level:");
+              Serial.print(pwmPowerLevel);
+              Serial.print("\n>"); 
+             }
+           if(*pComm=='m'){ 
+             float temppwmmax=(float)atoi(pComm+1)/100.;
+             if((temppwmmax<=1)&&(temppwmmax>=0)) pwmMaxPower=temppwmmax;   
+              if(pwmPowerLevel>pwmMaxPower){
+                pwmPowerLevel=pwmMaxPower;
+                Serial.print("Exceeded Max Duty Cycle, power set to Pmax");
+                
+              }
+              Serial.print("PWM max power level:");
+              Serial.print(pwmMaxPower);
+              Serial.print("\n>"); 
+            }
+           if(*pComm=='n'){ 
+             float tempn=atoi(pComm+1);
+             if((tempn<=MAXNCYCLES)&&(tempn>=MINNCYCLES)) pwmNCycles=tempn;   
+              Serial.print("PWM Ncycles:");
+              Serial.print(pwmNCycles);
+              Serial.print("\n>"); 
+            }
+           if(*pComm=='t'){ 
+             float tempt=atoi(pComm+1);
+             if((tempt<=MAXTIMERPERIOD)&&(tempt>=MINTIMERPERIOD)) pwmPeriod=tempt;   
+            }
+            i++;
+            
+        }
+        
+    //******************start command processing*********************//    
+    } else if(strcmp(myCommand[0],"read")==0){//process the stop command here
+    //Just an example showing how the extra arguments are accessed and used
+        while(i<nArguments){
+            char *pComm=myCommand[i];
+            if(*pComm=='a'){ address=atoi(pComm+1); }
+            i++;
+        }
+        
+    }
+}
+
+//Timer Interrupt handler
+void timer1ISR(){
+    //read thermistor temperature and report to analog monitor
+    Tc=readThermistor(thermistorInput,RBIAS,VBIAS,R0Thermistor,T0Thermistor,BetaThermistor)-273.15;
+
+    //If pwm enabled apply proper level
+    if(machineState&PWMON){
+      pwmLevel(pwmCurrentCycle,heaterRelay);
+      if(test) {
+        digitalWrite(4,HIGH);
+      } else {
+        digitalWrite(4,LOW);
+      }
+      test=~test;
+     } else {
+       digitalWrite(4,LOW);
+       digitalWrite(heaterRelay,LOW);
+    }
+    
+    //Update the cycle counter, if overflowed then reset to 1 and update power level, make temperature available
+    //to serial port reporting if enabled, note that temperature is read at every timer interrupt and posted to analog monitor
+    pwmCurrentCycle++;
+    if(pwmCurrentCycle>pwmNCycles){
+      pwmCurrentCycle=1;
+      //set flag so temperature may be displayed at relevant outputs
+      temperatureDataAvailable=1;
+   }
+       
+}
+
+//this function applies the proper PWM value in a time base by comparing the ratio of the current cycle to NCycles
+//and the power specified
+void pwmLevel(int pwmCurrentCycle,int PIN){
+  
+  int cycleLimit = (int)lround(pwmPowerLevel*(float)pwmNCycles);
+  if(pwmCurrentCycle==1){
+      digitalWrite(PIN,HIGH);
+  } else if(pwmCurrentCycle>=cycleLimit){
+      digitalWrite(PIN,LOW);
+  }
+  
+}
+
+//This function reads the analog input from a thermistor connected in a voltage divider
+//arrangement and return the temperature in degrees K
+//Need a way to return a non-valid temperature reading
+float readThermistor(int thermistorPin, float rbias, float vbias,float r0, float t0, float beta){  
+    float Rt,inverseT,T,vin;
+    int thermistorDiscrete;
+  
+    //Check that Analog pin is within the range of acceptable analog inputs TODO
+    thermistorDiscrete=analogRead(thermistorPin); //Read thermistor circuit voltage level
+    vin = (float)ADCVmax*(float)thermistorDiscrete/(float)ADCresolution;
+    Rt = (float)ADCVmax/vin*rbias-rbias;
+    inverseT=1./t0+1/beta*log(Rt/r0);
+    T=1/inverseT;
+    return T;
+}
+
+void start(long period){
+    Serial.print("In the start function, called interrupt with period[s]:");
+    Serial.println(period);
+    Serial.print("\n>");
+    delay(500);
+    Timer1.attachInterrupt(timer1ISR, period);
+    
+}
+
+void stop(void){
+    //detach interrupt.
+    Timer1.detachInterrupt();
+}
+
+void checkBLEstatus(void){
+  // Ask what is our current status
+  status = BTLEserial.getState();
+  // If the status changed....
+  if (status != laststatus) {
+    // print it out!
+    if (status == ACI_EVT_DEVICE_STARTED) {
+        Serial.println(F("* Advertising started"));
+    }
+    if (status == ACI_EVT_CONNECTED) {
+        Serial.println(F("* Connected!"));
+    }
+    if (status == ACI_EVT_DISCONNECTED) {
+        Serial.println(F("* Disconnected or advertising timed out"));
+    }
+    // OK set the last status change to this one
+    laststatus = status;
+  }
+}
+
+void printStatusBLE(void){
+    //Note that calling the BLTEserial.write within the timer interrup would hang the arduino, maybe 
+    //it does not support SPI within and interrupt??
+    char outputString[MAXCOMMANDLENGTH]="Temperature in C:";
+    char str[8];
+    sprintf(str,"%d>",(int)floor(Tc));
+    strcat(outputString,str);
+    if (status == ACI_EVT_CONNECTED) {
+      // We need to convert the line to bytes, no more than 20 at this time
+      String sout=outputString;
+      uint8_t sendbuffer[20];
+      sout.getBytes(sendbuffer, 20);
+      char sendbuffersize = min(20, sout.length());
+      Serial.print(F("\n* Sending -> \"")); 
+      Serial.print((char *)sendbuffer); 
+      Serial.println("\"");
+      Serial.print(">");
+      BTLEserial.write(sendbuffer, sendbuffersize);
+    }
+}
+
+
+void printStatusSerial(void){
+    Serial.print("Temperature in C:");
+    Serial.print(Tc);
+    Serial.print("\n>");
+}
+
