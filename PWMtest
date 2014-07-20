@@ -1,6 +1,10 @@
-//Thermistor Controlled HOT PLate program
-//This Program is an initial test for the AVEO platform
-//Implements an interpolation function for the thermistor, samples the
+//Thermistor Controlled HOT PLate program for Arduino UNO
+//Implements an interpolation function for the thermistor
+//Allows setting PWM at specified interval and duty cycle
+//Uses Bluetooth communications with the ADAfruit BLE platform
+//required the Adafruit_BLE_UART.h library for Arduino
+//Implements a 
+//Written by
 
 #include <TimerOne.h>
 #include <SPI.h>
